@@ -12,6 +12,8 @@ Import-Tidy scans Go files and ensures that import statements are properly group
 
 The tool can either check for formatting issues or automatically fix them.
 
+P.S. You can also add a custom order for import groups using the `--import-order` flag.
+
 ## Installation
 
 ```bash
@@ -29,12 +31,13 @@ go build -o import-tidy
 ## Usage
 
 ```bash
-import-tidy --internal-prefix=<your.internal.prefix> <path> [--fix]
+import-tidy --internal-prefix=<your.internal.prefix> [--import-order=standard,external,internal] <path> [--fix]
 ```
 
 ### Parameters
 
 - `--internal-prefix` (required): Specifies the import path prefix that identifies your organization's internal packages
+- `--import-order` (optional): Define a custom order for import groups, using a comma-separated list (default: `standard,external,internal`)
 - `<path>`: File or directory to process
 - `--fix` (optional): Apply fixes automatically instead of just checking
 
@@ -58,6 +61,12 @@ Process an entire directory and its subdirectories:
 import-tidy --internal-prefix=git.towiron.com . --fix
 ```
 
+Customize import order:
+
+```bash
+import-tidy --internal-prefix=git.towiron.com --import-order=external,standard,internal . --fix
+```
+
 ## How It Works
 
 Import-Tidy organizes imports by:
@@ -66,16 +75,22 @@ Import-Tidy organizes imports by:
 2. Sorting imports alphabetically within each group
 3. Adding appropriate spacing between groups
 4. Removing unnecessary blank lines within groups
+5. Enforcing a user-defined import order when specified
 
 ## Import Formatting Rules
 
 The tool enforces the following rules:
 
-- Imports are grouped by type (standard → external → internal)
+- Imports are grouped by type (standard → external → internal, or as defined by `--import-order`)
 - Each group is separated by a blank line
 - No blank lines within a group
 - Imports within each group are sorted alphabetically
 - Import aliases are preserved
+- Ensures consistent import order based on user-defined preferences
+
+## Contributing
+
+Contributions are welcome! If you find a bug or have a feature request, please open an issue or submit a pull request.
 
 ---
 

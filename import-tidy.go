@@ -7,15 +7,18 @@ import (
 	"go/ast"
 	"go/format"
 	"go/parser"
-	"go/printer"
 	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 )
 
-var internalPrefix string
+var (
+	internalPrefix string
+	importOrder    string
+)
 
 type (
 	ImportGroup int
@@ -37,13 +40,12 @@ type (
 )
 
 const (
-	_FILE_MODE = 0o600
-
 	_STANDARD_LIBRARY ImportGroup = iota
 	_EXTERNAL_LIBRARY
 	_INTERNAL_LIBRARY
 )
 
+// determineImportGroup determines the import group based on the import path.
 func determineImportGroup(importPath string) ImportGroup {
 	switch {
 	case !strings.Contains(importPath, "."):
@@ -54,9 +56,39 @@ func determineImportGroup(importPath string) ImportGroup {
 	return _EXTERNAL_LIBRARY
 }
 
+// parseImportOrder parses the user-defined import order.
+func parseImportOrder() []ImportGroup {
+	var (
+		order    []ImportGroup
+		orderMap = map[string]ImportGroup{
+			"standard": _STANDARD_LIBRARY,
+			"external": _EXTERNAL_LIBRARY,
+			"internal": _INTERNAL_LIBRARY,
+		}
+	)
+
+	for _, part := range strings.Split(importOrder, ",") {
+		group, exists := orderMap[strings.TrimSpace(part)]
+		if exists {
+			order = append(order, group)
+		}
+	}
+
+	if len(order) == 0 {
+		return []ImportGroup{_STANDARD_LIBRARY, _EXTERNAL_LIBRARY, _INTERNAL_LIBRARY}
+	}
+	return order
+}
+
+// checkImports checks if the imports in a Go file are correctly ordered and formatted.
 func checkImports(filePath string, shouldFix bool) error {
+	fileContent, err := os.ReadFile(filePath)
+	if err != nil {
+		return err
+	}
+
 	tokenFileSet := token.NewFileSet()
-	astNode, err := parser.ParseFile(tokenFileSet, filePath, nil, parser.ParseComments)
+	astNode, err := parser.ParseFile(tokenFileSet, filePath, fileContent, parser.ParseComments)
 	if err != nil {
 		return err
 	}
@@ -66,21 +98,22 @@ func checkImports(filePath string, shouldFix bool) error {
 		return nil
 	}
 
-	hasFormatError := validateImportFormat(imports, tokenFileSet)
+	hasFormatError := validateImportFormat(imports, tokenFileSet, parseImportOrder())
 
-	if hasFormatError && shouldFix {
+	if (hasFormatError || shouldFix) && shouldFix {
 		return reorganizeImports(RecognizeOptions{
 			FilePath:          filePath,
 			AstNode:           astNode,
 			ImportDeclaration: importDecl,
 			ImportsList:       imports,
 			TokenSet:          tokenFileSet,
-		})
+		}, string(fileContent))
 	}
 
 	return nil
 }
 
+// extractImports extracts import details from the given AST node.
 func extractImports(astNode *ast.File) (*ast.GenDecl, []ImportDetails) {
 	var importDecl *ast.GenDecl
 	var imports []ImportDetails
@@ -108,27 +141,35 @@ func extractImports(astNode *ast.File) (*ast.GenDecl, []ImportDetails) {
 	return importDecl, imports
 }
 
-func validateImportFormat(imports []ImportDetails, fset *token.FileSet) bool {
+func validateImportFormat(imports []ImportDetails, fset *token.FileSet, orderGroups []ImportGroup) bool {
+	if len(imports) <= 1 {
+		return false
+	}
+
+	groupPositions := make(map[ImportGroup]int)
+	for i, group := range orderGroups {
+		groupPositions[group] = i
+	}
+
 	var hasFormatError bool
-	var prevGroup ImportGroup = -1
+	var prevGroup = imports[0].Group
 
 	for i := 1; i < len(imports); i++ {
 		curr := imports[i]
 		prev := imports[i-1]
 
-		switch {
-		case curr.Group != prevGroup:
+		if groupPositions[curr.Group] < groupPositions[prevGroup] {
+			hasFormatError = true
+		}
+
+		if curr.Group != prev.Group {
 			if !hasBlankLineBefore(fset, prev.Position, curr.Position) {
 				hasFormatError = true
 			}
-		case curr.Group == prevGroup:
+		} else {
 			if hasBlankLineBefore(fset, prev.Position, curr.Position) {
 				hasFormatError = true
 			}
-		}
-
-		if curr.Group < prevGroup {
-			hasFormatError = true
 		}
 
 		prevGroup = curr.Group
@@ -143,133 +184,130 @@ func hasBlankLineBefore(tokenSet *token.FileSet, previousPos, currentPos token.P
 	return currentPosition.Line-previousPosition.Line > 1
 }
 
-// TODO: Optimize the code
-func reorganizeImports(opts RecognizeOptions) error {
-	var standardImports, externalImports, internalImports []ImportDetails
+func createNewImportContent(opts RecognizeOptions) (string, error) {
+	groupedImports := map[ImportGroup][]ImportDetails{}
 
 	for _, importItem := range opts.ImportsList {
-		switch importItem.Group {
-		case _STANDARD_LIBRARY:
-			standardImports = append(standardImports, importItem)
-		case _EXTERNAL_LIBRARY:
-			externalImports = append(externalImports, importItem)
-		case _INTERNAL_LIBRARY:
-			internalImports = append(internalImports, importItem)
+		groupedImports[importItem.Group] = append(groupedImports[importItem.Group], importItem)
+	}
+
+	for group := range groupedImports {
+		sort.Slice(groupedImports[group], func(i, j int) bool {
+			return groupedImports[group][i].Path < groupedImports[group][j].Path
+		})
+	}
+
+	totalImports := 0
+	for _, imports := range groupedImports {
+		totalImports += len(imports)
+	}
+
+	if totalImports == 1 {
+		for _, group := range parseImportOrder() {
+			imports, exists := groupedImports[group]
+			if exists && len(imports) == 1 {
+				importItem := imports[0]
+				if importItem.Name != "" {
+					return fmt.Sprintf("import %s %q", importItem.Name, importItem.Path), nil
+				} else {
+					return fmt.Sprintf("import %q", importItem.Path), nil
+				}
+			}
 		}
 	}
 
-	sort.Slice(standardImports, func(i, j int) bool {
-		return standardImports[i].Path < standardImports[j].Path
-	})
-	sort.Slice(externalImports, func(i, j int) bool {
-		return externalImports[i].Path < externalImports[j].Path
-	})
-	sort.Slice(internalImports, func(i, j int) bool {
-		return internalImports[i].Path < internalImports[j].Path
-	})
+	var importBuffer bytes.Buffer
+	importBuffer.WriteString("import (\n")
 
-	newImportDeclaration := &ast.GenDecl{
-		Tok:    token.IMPORT,
-		Lparen: opts.ImportDeclaration.Lparen,
-		Rparen: opts.ImportDeclaration.Rparen,
-	}
+	order := parseImportOrder()
+	isFirstGroup := true
 
-	for _, importItem := range standardImports {
-		newImportDeclaration.Specs = append(newImportDeclaration.Specs,
-			createImportSpecification(importItem))
-	}
+	for _, group := range order {
+		imports, exists := groupedImports[group]
+		if !exists || len(imports) == 0 {
+			continue
+		}
 
-	if len(externalImports) > 0 && len(standardImports) > 0 {
-		newImportDeclaration.Specs = append(newImportDeclaration.Specs,
-			createGroupSeparator())
-	}
+		if !isFirstGroup {
+			importBuffer.WriteString("\n")
+		}
+		isFirstGroup = false
 
-	for _, importItem := range externalImports {
-		newImportDeclaration.Specs = append(newImportDeclaration.Specs,
-			createImportSpecification(importItem))
-	}
-
-	if len(internalImports) > 0 && (len(standardImports) > 0 || len(externalImports) > 0) {
-		newImportDeclaration.Specs = append(newImportDeclaration.Specs,
-			createGroupSeparator())
-	}
-
-	for _, importItem := range internalImports {
-		newImportDeclaration.Specs = append(newImportDeclaration.Specs,
-			createImportSpecification(importItem))
-	}
-
-	for i, declaration := range opts.AstNode.Decls {
-		genDeclaration, isGenDecl := declaration.(*ast.GenDecl)
-		if isGenDecl && genDeclaration.Tok == token.IMPORT {
-			opts.AstNode.Decls[i] = newImportDeclaration
-			break
+		for _, importItem := range imports {
+			if importItem.Name != "" {
+				importBuffer.WriteString(fmt.Sprintf("\t%s %q\n", importItem.Name, importItem.Path))
+			} else {
+				importBuffer.WriteString(fmt.Sprintf("\t%q\n", importItem.Path))
+			}
 		}
 	}
 
-	var outputBuffer bytes.Buffer
-	if err := printer.Fprint(&outputBuffer, opts.TokenSet, opts.AstNode); err != nil {
+	importBuffer.WriteString(")")
+	return importBuffer.String(), nil
+}
+
+func reorganizeImports(opts RecognizeOptions, originalContent string) error {
+	fileInfo, err := os.Stat(opts.FilePath)
+	if err != nil {
+		return err
+	}
+	originalMode := fileInfo.Mode()
+
+	importPos := opts.TokenSet.Position(opts.ImportDeclaration.Pos())
+	importEnd := opts.TokenSet.Position(opts.ImportDeclaration.End())
+
+	newImportContent, err := createNewImportContent(opts)
+	if err != nil {
 		return err
 	}
 
-	formattedContent := outputBuffer.String()
-	formattedContent = strings.ReplaceAll(
-		formattedContent,
-		"\"IMPORTGROUP_SEPARATOR\"\n",
-		"\n",
-	)
+	lines := strings.Split(originalContent, "\n")
+	importStartLine := importPos.Line - 1
+	importEndLine := importEnd.Line - 1
 
-	finalContent, formatErr := format.Source([]byte(formattedContent))
+	var newContent strings.Builder
+
+	for i := 0; i < importStartLine; i++ {
+		newContent.WriteString(lines[i])
+		newContent.WriteString("\n")
+	}
+
+	newContent.WriteString(newImportContent)
+	newContent.WriteString("\n")
+
+	for i := importEndLine + 1; i < len(lines); i++ {
+		newContent.WriteString(lines[i])
+		if i < len(lines)-1 {
+			newContent.WriteString("\n")
+		}
+	}
+
+	finalContent, formatErr := format.Source([]byte(newContent.String()))
 	if formatErr != nil {
-		finalContent = []byte(formattedContent)
+		finalContent = []byte(newContent.String())
 	}
 
-	return os.WriteFile(opts.FilePath, finalContent, _FILE_MODE)
+	return os.WriteFile(opts.FilePath, finalContent, originalMode)
 }
 
-func createImportSpecification(importDetails ImportDetails) *ast.ImportSpec {
-	spec := &ast.ImportSpec{
-		Path: &ast.BasicLit{
-			Kind:  token.STRING,
-			Value: `"` + importDetails.Path + `"`,
-		},
-	}
-
-	if importDetails.Name != "" {
-		spec.Name = &ast.Ident{Name: importDetails.Name}
-	}
-
-	return spec
-}
-
-func createGroupSeparator() *ast.ImportSpec {
-	return &ast.ImportSpec{
-		Path: &ast.BasicLit{
-			Kind:  token.STRING,
-			Value: `"IMPORTGROUP_SEPARATOR"`,
-		},
-	}
-}
-
+// processDirectory recursively scans a directory and checks all Go files for import correctness.
 func processDirectory(directoryPath string, shouldFix bool) error {
-	return filepath.Walk(
-		directoryPath,
-		func(filePath string, fileInfo os.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-			if !fileInfo.IsDir() && strings.HasSuffix(filePath, ".go") {
-				return checkImports(filePath, shouldFix)
-			}
-			return nil
-		})
+	return filepath.WalkDir(directoryPath, func(filePath string, dirEntry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if !dirEntry.IsDir() && strings.HasSuffix(filePath, ".go") {
+			return checkImports(filePath, shouldFix)
+		}
+
+		return nil
+	})
 }
 
 func main() {
-	flag.StringVar(&internalPrefix,
-		"internal-prefix",
-		"",
-		"Prefix for internal imports (required)")
+	flag.StringVar(&internalPrefix, "internal-prefix", "", "Prefix for internal imports (required)")
+	flag.StringVar(&importOrder, "import-order", "standard,external,internal", "Comma-separated import order")
 	flag.Parse()
 
 	if internalPrefix == "" {
@@ -301,6 +339,4 @@ func main() {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
-
-	fmt.Println("done!")
 }

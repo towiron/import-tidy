@@ -1,91 +1,58 @@
+version: "2"
 
-linters-settings:
-  dupl:
-    threshold: 100
-  funlen:
-    lines: -1
-    statements: 50
-  goconst:
-    min-len: 2
-    min-occurrences: 3
-  gocritic:
-    enabled-tags:
-      - diagnostic
-      - experimental
-      - opinionated
-      - performance
-      - style
-    disabled-checks:
-      - rangeValCopy
-      - hugeParam
-      - unnamedResult
-      - sloppyReassign
-  gocyclo:
-    min-complexity: 15
-  gofmt:
-    rewrite-rules:
-      - pattern: 'interface{}'
-        replacement: 'any'
-  goimports:
-    local-prefixes: git.uzinfocom.uz/moh/dhp
-  mnd:
-    checks:
-      - argument
-      - case
-      - condition
-      - return
-    ignored-numbers:
-      - '42'
-  revive:
-    rules:
-      - name: var-naming
-        disabled: true
-linters:
-  disable-all: true
-  enable:
-    - bodyclose
-    - dogsled
-    - errcheck
-    - copyloopvar
-    - funlen
-    - gocheckcompilerdirectives
-    - gochecknoinits
-    - goconst
-    - gocritic
-    - gocyclo
-    - gofmt
-    - goimports
-    - mnd
-    - goprintffuncname
-    - gosec
-    - gosimple
-    - govet
-    - ineffassign
-    - misspell
-    - nakedret
-    - noctx
-    - nolintlint
-    - revive
-    - staticcheck
-    - stylecheck
-    - typecheck
-    - unconvert
-    - unparam
-    - unused
-    - whitespace
 issues:
-  exclude-rules:
-    - linters:
-        - stylecheck
-      text: "ST1003:"
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  uniq-by-line: true
 
-    - linters:
-        - staticcheck
-      text: "SA1019:"
-
-    - path: _test\.go
-      linters:
-        - mnd
-        - gocritic
-run:
-  timeout: 5m
+linters:
+  default: all
+  enable: []
+  disable:
+    - dupl # remove
+    - nestif # remove
+    - noctx
+    - errchkjson
+    - contextcheck
+    - interfacebloat
+    - godot
+    - gosec
+    - cyclop
+    - depguard
+    - funcorder
+    - godox
+    - gochecknoglobals
+    - err113
+    - exhaustive
+    - exhaustruct
+    - ireturn
+    - tagliatelle
+    - revive
+    - nonamedreturns
+    - inamedparam
+    - paralleltest
+    - maintidx
+    - iface
+    - varnamelen
+    - wrapcheck
+    - wsl
+    - wsl_v5
+    - goconst
+    - gomodguard
+  settings:
+    funlen:
+      lines: 150
+      statements: 80
+    gocognit:
+      min-complexity: 60
+    gocritic:
+      disabled-checks:
+        - captLocal
+    staticcheck:
+      checks:
+        - all
+        - "-S1040"
+        - "-ST1000"
+        - "-ST1003"
+        - "-ST1012"
+        - "-ST1021"

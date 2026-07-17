@@ -1,342 +1,488 @@
+// Command import-tidy checks and fixes the grouping and ordering of import
+// statements in Go source files.
+//
+// Imports are split into three groups — standard library, external, and
+// internal (matched by -internal-prefix) — sorted alphabetically within each
+// group and separated by single blank lines. Multiple import declarations
+// are merged into one block; aliases and comments attached to imports are
+// preserved.
+//
+// Usage:
+//
+//	import-tidy -internal-prefix=<prefix> [-import-order=standard,external,internal] [-fix] <path>...
+//
+// Without -fix the tool reports files whose imports need reorganizing and
+// exits with code 1; with -fix it rewrites them in place.
 package main
 
 import (
-	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"go/ast"
 	"go/format"
 	"go/parser"
 	"go/token"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
+	"strconv"
 	"strings"
 )
 
-var (
-	internalPrefix string
-	importOrder    string
+const (
+	exitOK          = 0
+	exitIssuesFound = 1
+	exitError       = 2
 )
 
-type (
-	ImportGroup int
-
-	ImportDetails struct {
-		Path     string
-		Group    ImportGroup
-		Name     string
-		Position token.Pos
-	}
-
-	RecognizeOptions struct {
-		FilePath          string
-		AstNode           *ast.File
-		ImportDeclaration *ast.GenDecl
-		ImportsList       []ImportDetails
-		TokenSet          *token.FileSet
-	}
-)
+type importGroup int
 
 const (
-	_STANDARD_LIBRARY ImportGroup = iota
-	_EXTERNAL_LIBRARY
-	_INTERNAL_LIBRARY
+	standardLibrary importGroup = iota
+	externalLibrary
+	internalLibrary
 )
 
-// determineImportGroup determines the import group based on the import path.
-func determineImportGroup(importPath string) ImportGroup {
-	switch {
-	case !strings.Contains(importPath, "."):
-		return _STANDARD_LIBRARY
-	case strings.HasPrefix(importPath, internalPrefix):
-		return _INTERNAL_LIBRARY
-	}
-	return _EXTERNAL_LIBRARY
+var groupNames = map[string]importGroup{
+	"standard": standardLibrary,
+	"external": externalLibrary,
+	"internal": internalLibrary,
 }
 
-// parseImportOrder parses the user-defined import order.
-func parseImportOrder() []ImportGroup {
-	var (
-		order    []ImportGroup
-		orderMap = map[string]ImportGroup{
-			"standard": _STANDARD_LIBRARY,
-			"external": _EXTERNAL_LIBRARY,
-			"internal": _INTERNAL_LIBRARY,
-		}
-	)
+type config struct {
+	internalPrefix string
+	groupOrder     []importGroup
+	fix            bool
+}
 
-	for _, part := range strings.Split(importOrder, ",") {
-		group, exists := orderMap[strings.TrimSpace(part)]
-		if exists {
+func main() {
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+func run(args []string, stdout, stderr io.Writer) int {
+	cfg, paths, err := parseArgs(args, stderr)
+	if errors.Is(err, flag.ErrHelp) {
+		return exitOK
+	}
+	if err != nil {
+		fprintln(stderr, "Error:", err)
+
+		return exitError
+	}
+
+	flagged := make([]string, 0, len(paths))
+	for _, target := range paths {
+		files, err := processPath(target, cfg)
+		if err != nil {
+			fprintln(stderr, "Error:", err)
+
+			return exitError
+		}
+		flagged = append(flagged, files...)
+	}
+
+	label := "needs formatting:"
+	if cfg.fix {
+		label = "fixed:"
+	}
+	for _, file := range flagged {
+		fprintln(stdout, label, file)
+	}
+
+	if len(flagged) > 0 && !cfg.fix {
+		return exitIssuesFound
+	}
+
+	return exitOK
+}
+
+func parseArgs(args []string, stderr io.Writer) (config, []string, error) {
+	flags := flag.NewFlagSet("import-tidy", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	internalPrefix := flags.String("internal-prefix", "", "prefix identifying internal imports (required)")
+	importOrder := flags.String("import-order", "standard,external,internal", "comma-separated import group order")
+	fix := flags.Bool("fix", false, "rewrite files instead of just reporting issues")
+
+	err := flags.Parse(args)
+	if err != nil {
+		return config{}, nil, err
+	}
+
+	var paths []string
+	for _, arg := range flags.Args() {
+		if arg == "--fix" || arg == "-fix" {
+			*fix = true
+
+			continue
+		}
+		paths = append(paths, arg)
+	}
+
+	if *internalPrefix == "" {
+		return config{}, nil, errors.New("-internal-prefix is required")
+	}
+	if len(paths) == 0 {
+		return config{}, nil, errors.New("path to a file or directory is required")
+	}
+
+	groupOrder, err := parseImportOrder(*importOrder)
+	if err != nil {
+		return config{}, nil, fmt.Errorf("invalid -import-order: %w", err)
+	}
+
+	return config{
+		internalPrefix: *internalPrefix,
+		groupOrder:     groupOrder,
+		fix:            *fix,
+	}, paths, nil
+}
+
+func parseImportOrder(spec string) ([]importGroup, error) {
+	var order []importGroup
+	seen := make(map[importGroup]bool, len(groupNames))
+
+	for part := range strings.SplitSeq(spec, ",") {
+		name := strings.TrimSpace(part)
+		if name == "" {
+			continue
+		}
+		group, ok := groupNames[name]
+		if !ok {
+			return nil, fmt.Errorf("unknown import group %q (valid: standard, external, internal)", name)
+		}
+		if seen[group] {
+			continue
+		}
+		seen[group] = true
+		order = append(order, group)
+	}
+
+	for _, group := range []importGroup{standardLibrary, externalLibrary, internalLibrary} {
+		if !seen[group] {
 			order = append(order, group)
 		}
 	}
 
-	if len(order) == 0 {
-		return []ImportGroup{_STANDARD_LIBRARY, _EXTERNAL_LIBRARY, _INTERNAL_LIBRARY}
-	}
-	return order
+	return order, nil
 }
 
-// checkImports checks if the imports in a Go file are correctly ordered and formatted.
-func checkImports(filePath string, shouldFix bool) error {
-	fileContent, err := os.ReadFile(filePath)
+func processPath(target string, cfg config) ([]string, error) {
+	info, err := os.Stat(target)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	tokenFileSet := token.NewFileSet()
-	astNode, err := parser.ParseFile(tokenFileSet, filePath, fileContent, parser.ParseComments)
-	if err != nil {
-		return err
+	if info.IsDir() {
+		return processDirectory(target, cfg)
 	}
 
-	importDecl, imports := extractImports(astNode)
-	if importDecl == nil {
-		return nil
+	changed, err := checkImports(target, cfg)
+	if err != nil || !changed {
+		return nil, err
 	}
 
-	hasFormatError := validateImportFormat(imports, tokenFileSet, parseImportOrder())
-
-	if (hasFormatError || shouldFix) && shouldFix {
-		return reorganizeImports(RecognizeOptions{
-			FilePath:          filePath,
-			AstNode:           astNode,
-			ImportDeclaration: importDecl,
-			ImportsList:       imports,
-			TokenSet:          tokenFileSet,
-		}, string(fileContent))
-	}
-
-	return nil
+	return []string{target}, nil
 }
 
-// extractImports extracts import details from the given AST node.
-func extractImports(astNode *ast.File) (*ast.GenDecl, []ImportDetails) {
-	var importDecl *ast.GenDecl
-	var imports []ImportDetails
-
-	for _, decl := range astNode.Decls {
-		if genDecl, ok := decl.(*ast.GenDecl); ok && genDecl.Tok == token.IMPORT {
-			importDecl = genDecl
-			for _, spec := range genDecl.Specs {
-				importSpec := spec.(*ast.ImportSpec)
-				importPath := strings.Trim(importSpec.Path.Value, "\"")
-				importName := ""
-				if importSpec.Name != nil {
-					importName = importSpec.Name.Name
-				}
-				imports = append(imports, ImportDetails{
-					Path:     importPath,
-					Group:    determineImportGroup(importPath),
-					Name:     importName,
-					Position: importSpec.Pos(),
-				})
-			}
-			break
-		}
-	}
-	return importDecl, imports
+var skippedDirs = map[string]bool{
+	"vendor":       true,
+	"testdata":     true,
+	"node_modules": true,
 }
 
-func validateImportFormat(imports []ImportDetails, fset *token.FileSet, orderGroups []ImportGroup) bool {
-	if len(imports) <= 1 {
-		return false
-	}
+func processDirectory(root string, cfg config) ([]string, error) {
+	var flagged []string
 
-	groupPositions := make(map[ImportGroup]int)
-	for i, group := range orderGroups {
-		groupPositions[group] = i
-	}
-
-	var hasFormatError bool
-	var prevGroup = imports[0].Group
-
-	for i := 1; i < len(imports); i++ {
-		curr := imports[i]
-		prev := imports[i-1]
-
-		if groupPositions[curr.Group] < groupPositions[prevGroup] {
-			hasFormatError = true
-		}
-
-		if curr.Group != prev.Group {
-			if !hasBlankLineBefore(fset, prev.Position, curr.Position) {
-				hasFormatError = true
-			}
-		} else {
-			if hasBlankLineBefore(fset, prev.Position, curr.Position) {
-				hasFormatError = true
-			}
-		}
-
-		prevGroup = curr.Group
-	}
-
-	return hasFormatError
-}
-
-func hasBlankLineBefore(tokenSet *token.FileSet, previousPos, currentPos token.Pos) bool {
-	previousPosition := tokenSet.Position(previousPos)
-	currentPosition := tokenSet.Position(currentPos)
-	return currentPosition.Line-previousPosition.Line > 1
-}
-
-func createNewImportContent(opts RecognizeOptions) (string, error) {
-	groupedImports := map[ImportGroup][]ImportDetails{}
-
-	for _, importItem := range opts.ImportsList {
-		groupedImports[importItem.Group] = append(groupedImports[importItem.Group], importItem)
-	}
-
-	for group := range groupedImports {
-		sort.Slice(groupedImports[group], func(i, j int) bool {
-			return groupedImports[group][i].Path < groupedImports[group][j].Path
-		})
-	}
-
-	totalImports := 0
-	for _, imports := range groupedImports {
-		totalImports += len(imports)
-	}
-
-	if totalImports == 1 {
-		for _, group := range parseImportOrder() {
-			imports, exists := groupedImports[group]
-			if exists && len(imports) == 1 {
-				importItem := imports[0]
-				if importItem.Name != "" {
-					return fmt.Sprintf("import %s %q", importItem.Name, importItem.Path), nil
-				} else {
-					return fmt.Sprintf("import %q", importItem.Path), nil
-				}
-			}
-		}
-	}
-
-	var importBuffer bytes.Buffer
-	importBuffer.WriteString("import (\n")
-
-	order := parseImportOrder()
-	isFirstGroup := true
-
-	for _, group := range order {
-		imports, exists := groupedImports[group]
-		if !exists || len(imports) == 0 {
-			continue
-		}
-
-		if !isFirstGroup {
-			importBuffer.WriteString("\n")
-		}
-		isFirstGroup = false
-
-		for _, importItem := range imports {
-			if importItem.Name != "" {
-				importBuffer.WriteString(fmt.Sprintf("\t%s %q\n", importItem.Name, importItem.Path))
-			} else {
-				importBuffer.WriteString(fmt.Sprintf("\t%q\n", importItem.Path))
-			}
-		}
-	}
-
-	importBuffer.WriteString(")")
-	return importBuffer.String(), nil
-}
-
-func reorganizeImports(opts RecognizeOptions, originalContent string) error {
-	fileInfo, err := os.Stat(opts.FilePath)
-	if err != nil {
-		return err
-	}
-	originalMode := fileInfo.Mode()
-
-	importPos := opts.TokenSet.Position(opts.ImportDeclaration.Pos())
-	importEnd := opts.TokenSet.Position(opts.ImportDeclaration.End())
-
-	newImportContent, err := createNewImportContent(opts)
-	if err != nil {
-		return err
-	}
-
-	lines := strings.Split(originalContent, "\n")
-	importStartLine := importPos.Line - 1
-	importEndLine := importEnd.Line - 1
-
-	var newContent strings.Builder
-
-	for i := 0; i < importStartLine; i++ {
-		newContent.WriteString(lines[i])
-		newContent.WriteString("\n")
-	}
-
-	newContent.WriteString(newImportContent)
-	newContent.WriteString("\n")
-
-	for i := importEndLine + 1; i < len(lines); i++ {
-		newContent.WriteString(lines[i])
-		if i < len(lines)-1 {
-			newContent.WriteString("\n")
-		}
-	}
-
-	finalContent, formatErr := format.Source([]byte(newContent.String()))
-	if formatErr != nil {
-		finalContent = []byte(newContent.String())
-	}
-
-	return os.WriteFile(opts.FilePath, finalContent, originalMode)
-}
-
-// processDirectory recursively scans a directory and checks all Go files for import correctness.
-func processDirectory(directoryPath string, shouldFix bool) error {
-	return filepath.WalkDir(directoryPath, func(filePath string, dirEntry fs.DirEntry, err error) error {
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 
-		if !dirEntry.IsDir() && strings.HasSuffix(filePath, ".go") {
-			return checkImports(filePath, shouldFix)
+		if entry.IsDir() {
+			name := entry.Name()
+			if path != root && (skippedDirs[name] || strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_")) {
+				return filepath.SkipDir
+			}
+
+			return nil
+		}
+
+		if !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+
+		changed, err := checkImports(path, cfg)
+		if err != nil {
+			return err
+		}
+		if changed {
+			flagged = append(flagged, path)
 		}
 
 		return nil
 	})
+
+	return flagged, err
 }
 
-func main() {
-	flag.StringVar(&internalPrefix, "internal-prefix", "", "Prefix for internal imports (required)")
-	flag.StringVar(&importOrder, "import-order", "standard,external,internal", "Comma-separated import order")
-	flag.Parse()
-
-	if internalPrefix == "" {
-		fmt.Println("Error: --internal-prefix is required")
-		os.Exit(1)
-	}
-
-	if flag.NArg() < 1 {
-		fmt.Println("Error: path to the file or directory is required")
-		os.Exit(1)
-	}
-
-	targetPath := flag.Arg(0)
-	shouldFix := flag.NArg() > 1 && flag.Arg(1) == "--fix"
-
-	fileInfo, err := os.Stat(targetPath)
+func checkImports(filePath string, cfg config) (bool, error) {
+	file, err := loadSourceFile(filePath, cfg.internalPrefix)
 	if err != nil {
-		fmt.Printf("Error: failed to access %s: %v\n", targetPath, err)
-		os.Exit(1)
+		return false, err
 	}
 
-	if fileInfo.IsDir() {
-		err = processDirectory(targetPath, shouldFix)
-	} else {
-		err = checkImports(targetPath, shouldFix)
+	if len(file.decls) == 0 || !file.needsTidy(cfg.groupOrder) {
+		return false, nil
+	}
+	if !cfg.fix {
+		return true, nil
 	}
 
+	fixed, err := file.tidy(cfg.groupOrder)
 	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		os.Exit(1)
+		return false, err
 	}
+
+	err = os.WriteFile(filePath, fixed, file.mode)
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+type sourceFile struct {
+	path    string
+	content []byte
+	mode    fs.FileMode
+	fset    *token.FileSet
+	decls   []*ast.GenDecl
+	imports []importInfo
+}
+
+type importInfo struct {
+	path      string
+	group     importGroup
+	name      string
+	doc       []string
+	comment   string
+	startLine int
+	endLine   int
+}
+
+func loadSourceFile(path, internalPrefix string) (*sourceFile, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	fset := token.NewFileSet()
+	astFile, err := parser.ParseFile(fset, path, content, parser.ParseComments)
+	if err != nil {
+		return nil, err
+	}
+
+	file := &sourceFile{
+		path:    path,
+		content: content,
+		mode:    info.Mode(),
+		fset:    fset,
+	}
+	for _, decl := range astFile.Decls {
+		genDecl, ok := decl.(*ast.GenDecl)
+		if !ok || genDecl.Tok != token.IMPORT {
+			continue
+		}
+		file.decls = append(file.decls, genDecl)
+		for _, spec := range genDecl.Specs {
+			importSpec, ok := spec.(*ast.ImportSpec)
+			if !ok {
+				continue
+			}
+			file.imports = append(file.imports, newImportInfo(fset, importSpec, internalPrefix))
+		}
+	}
+
+	return file, nil
+}
+
+func newImportInfo(fset *token.FileSet, spec *ast.ImportSpec, internalPrefix string) importInfo {
+	importPath := strings.Trim(spec.Path.Value, `"`)
+
+	info := importInfo{
+		path:      importPath,
+		group:     determineImportGroup(importPath, internalPrefix),
+		startLine: fset.Position(spec.Pos()).Line,
+		endLine:   fset.Position(spec.End()).Line,
+	}
+	if spec.Name != nil {
+		info.name = spec.Name.Name
+	}
+	if spec.Doc != nil {
+		for _, comment := range spec.Doc.List {
+			info.doc = append(info.doc, comment.Text)
+		}
+		info.startLine = fset.Position(spec.Doc.Pos()).Line
+	}
+	if spec.Comment != nil && len(spec.Comment.List) > 0 {
+		info.comment = spec.Comment.List[0].Text
+		info.endLine = fset.Position(spec.Comment.End()).Line
+	}
+
+	return info
+}
+
+func determineImportGroup(importPath, internalPrefix string) importGroup {
+	if importPath == internalPrefix || strings.HasPrefix(importPath, internalPrefix+"/") {
+		return internalLibrary
+	}
+
+	firstSegment, _, _ := strings.Cut(importPath, "/")
+	if strings.Contains(firstSegment, ".") {
+		return externalLibrary
+	}
+
+	return standardLibrary
+}
+
+func (f *sourceFile) needsTidy(order []importGroup) bool {
+	if len(f.decls) > 1 {
+		return true
+	}
+	if len(f.imports) <= 1 {
+		return false
+	}
+
+	position := make(map[importGroup]int, len(order))
+	for i, group := range order {
+		position[group] = i
+	}
+
+	for i := 1; i < len(f.imports); i++ {
+		prev, curr := f.imports[i-1], f.imports[i]
+		sameGroup := prev.group == curr.group
+		blankBetween := curr.startLine-prev.endLine > 1
+
+		switch {
+		case position[curr.group] < position[prev.group]:
+			return true // groups out of order
+		case !sameGroup && !blankBetween:
+			return true // missing blank line between groups
+		case sameGroup && blankBetween:
+			return true // stray blank line inside a group
+		case sameGroup && prev.path > curr.path:
+			return true // not sorted alphabetically
+		}
+	}
+
+	return false
+}
+
+func (f *sourceFile) tidy(order []importGroup) ([]byte, error) {
+	insertLine := f.fset.Position(f.decls[0].Pos()).Line
+
+	removed := make(map[int]bool)
+	for _, decl := range f.decls {
+		start := f.fset.Position(decl.Pos()).Line
+		end := f.fset.Position(decl.End()).Line
+		for line := start; line <= end; line++ {
+			removed[line] = true
+		}
+	}
+
+	var b strings.Builder
+	for i, line := range strings.Split(string(f.content), "\n") {
+		lineNo := i + 1
+		if lineNo == insertLine {
+			b.WriteString(renderImportDecl(f.imports, order))
+			b.WriteByte('\n')
+		}
+		if removed[lineNo] {
+			continue
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+
+	formatted, err := format.Source([]byte(b.String()))
+	if err != nil {
+		return nil, fmt.Errorf("reorganized %s does not format cleanly (file left unchanged): %w", f.path, err)
+	}
+
+	return formatted, nil
+}
+
+func renderImportDecl(imports []importInfo, order []importGroup) string {
+	var b strings.Builder
+
+	if len(imports) == 1 {
+		for _, doc := range imports[0].doc {
+			b.WriteString(doc)
+			b.WriteByte('\n')
+		}
+		b.WriteString("import ")
+		writeImportLine(&b, imports[0])
+
+		return b.String()
+	}
+
+	grouped := make(map[importGroup][]importInfo)
+	for _, imp := range imports {
+		grouped[imp.group] = append(grouped[imp.group], imp)
+	}
+
+	b.WriteString("import (\n")
+	firstGroup := true
+	for _, group := range order {
+		specs := grouped[group]
+		if len(specs) == 0 {
+			continue
+		}
+		slices.SortFunc(specs, func(a, b importInfo) int {
+			return strings.Compare(a.path, b.path)
+		})
+
+		if !firstGroup {
+			b.WriteByte('\n')
+		}
+		firstGroup = false
+
+		for _, imp := range specs {
+			for _, doc := range imp.doc {
+				b.WriteByte('\t')
+				b.WriteString(doc)
+				b.WriteByte('\n')
+			}
+			b.WriteByte('\t')
+			writeImportLine(&b, imp)
+			b.WriteByte('\n')
+		}
+	}
+	b.WriteString(")")
+
+	return b.String()
+}
+
+func writeImportLine(b *strings.Builder, imp importInfo) {
+	if imp.name != "" {
+		b.WriteString(imp.name)
+		b.WriteByte(' ')
+	}
+	b.WriteString(strconv.Quote(imp.path))
+	if imp.comment != "" {
+		b.WriteByte(' ')
+		b.WriteString(imp.comment)
+	}
+}
+
+func fprintln(w io.Writer, args ...any) {
+	_, _ = fmt.Fprintln(w, args...)
 }

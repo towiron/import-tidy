@@ -31,15 +31,21 @@ go build -o import-tidy
 ## Usage
 
 ```bash
-import-tidy --internal-prefix=<your.internal.prefix> [--import-order=standard,external,internal] <path> [--fix]
+import-tidy --internal-prefix=<your.internal.prefix> [--import-order=standard,external,internal] [--fix] <path>...
 ```
 
 ### Parameters
 
 - `--internal-prefix` (required): Specifies the import path prefix that identifies your organization's internal packages
-- `--import-order` (optional): Define a custom order for import groups, using a comma-separated list (default: `standard,external,internal`)
-- `<path>`: File or directory to process
-- `--fix` (optional): Apply fixes automatically instead of just checking
+- `--import-order` (optional): Define a custom order for import groups, using a comma-separated list (default: `standard,external,internal`). Unknown group names are rejected; groups you omit are appended at the end, so no imports are ever dropped
+- `<path>`: One or more files or directories to process (`vendor/`, `testdata/`, and hidden directories are skipped)
+- `--fix` (optional): Apply fixes automatically instead of just checking. May be placed before or after the path
+
+### Exit codes
+
+- `0` — no issues found (or all issues fixed with `--fix`)
+- `1` — check mode found files that need formatting (each is printed as `needs formatting: <file>`)
+- `2` — invalid usage or a runtime error
 
 ### Examples
 
@@ -72,10 +78,14 @@ import-tidy --internal-prefix=git.towiron.com --import-order=external,standard,i
 Import-Tidy organizes imports by:
 
 1. Identifying and categorizing imports into standard, external, and internal groups
-2. Sorting imports alphabetically within each group
-3. Adding appropriate spacing between groups
-4. Removing unnecessary blank lines within groups
-5. Enforcing a user-defined import order when specified
+2. Merging multiple import declarations into a single block
+3. Sorting imports alphabetically within each group
+4. Adding appropriate spacing between groups
+5. Removing unnecessary blank lines within groups
+6. Preserving import aliases and comments attached to imports
+7. Enforcing a user-defined import order when specified
+
+Files that are already correctly formatted are left untouched.
 
 ## Import Formatting Rules
 

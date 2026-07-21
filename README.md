@@ -1,5 +1,11 @@
 # Import-Tidy
 
+[![CI](https://github.com/towiron/import-tidy/actions/workflows/ci.yml/badge.svg)](https://github.com/towiron/import-tidy/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/towiron/import-tidy)](https://goreportcard.com/report/github.com/towiron/import-tidy)
+[![Go Reference](https://pkg.go.dev/badge/github.com/towiron/import-tidy.svg)](https://pkg.go.dev/github.com/towiron/import-tidy)
+[![Latest Release](https://img.shields.io/github/v/release/towiron/import-tidy)](https://github.com/towiron/import-tidy/releases/latest)
+[![License](https://img.shields.io/github/license/towiron/import-tidy)](LICENSE)
+
 A tool for automatically organizing and formatting import statements in Go files according to best practices.
 
 ## Overview
@@ -73,6 +79,61 @@ Customize import order:
 import-tidy --internal-prefix=git.towiron.com --import-order=external,standard,internal . --fix
 ```
 
+## Before / After Example
+
+Given `example.go` with unsorted, ungrouped imports:
+
+```go
+package main
+
+import (
+	"github.com/towiron/import-tidy/internal/formatter"
+	"fmt"
+
+	"os"
+	"github.com/spf13/cobra"
+	"strings"
+)
+
+func main() {
+	fmt.Println(os.Args, strings.Join(os.Args, ","), cobra.Command{}, formatter.Run)
+}
+```
+
+Running in check mode reports the file as unformatted and exits with code `1`:
+
+```console
+$ import-tidy --internal-prefix=github.com/towiron/import-tidy example.go
+needs formatting: example.go
+```
+
+Running with `--fix` rewrites the file in place and exits with code `0`:
+
+```console
+$ import-tidy --internal-prefix=github.com/towiron/import-tidy example.go --fix
+fixed: example.go
+```
+
+`example.go` after the fix — grouped into standard, external, and internal blocks, each sorted alphabetically:
+
+```go
+package main
+
+import (
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/spf13/cobra"
+
+	"github.com/towiron/import-tidy/internal/formatter"
+)
+
+func main() {
+	fmt.Println(os.Args, strings.Join(os.Args, ","), cobra.Command{}, formatter.Run)
+}
+```
+
 ## How It Works
 
 Import-Tidy organizes imports by:
@@ -100,7 +161,7 @@ The tool enforces the following rules:
 
 ## Contributing
 
-Contributions are welcome! If you find a bug or have a feature request, please open an issue or submit a pull request.
+Contributions are welcome! If you find a bug or have a feature request, please open an issue or submit a pull request. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and workflow details.
 
 ---
 
